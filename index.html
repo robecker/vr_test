@@ -57,6 +57,43 @@
   }
   #ipd button:active{background:#222}
   .hidden{display:none !important}
+
+  #recRow{
+    position:fixed;
+    bottom:calc(48px + env(safe-area-inset-bottom));
+    left:50%;transform:translateX(-50%);
+    z-index:40;font-size:11px;color:var(--dim);
+  }
+  #recLabel{display:flex;align-items:center;gap:8px}
+  #recToggle{width:15px;height:15px}
+
+  #camPreview{
+    position:fixed;
+    top:calc(10px + env(safe-area-inset-top));
+    right:calc(10px + env(safe-area-inset-right));
+    width:110px;height:82px;
+    border-radius:8px;
+    border:1px solid rgba(255,255,255,0.25);
+    object-fit:cover;
+    transform:scaleX(-1);
+    z-index:45;
+    display:none;
+    background:#000;
+  }
+  body.show-preview #camPreview{ display:block; }
+
+  #downloads{
+    position:fixed;
+    bottom:calc(10px + env(safe-area-inset-bottom));
+    left:50%;transform:translateX(-50%);
+    z-index:40;
+    display:flex;gap:16px;
+  }
+  #downloads a{
+    font-size:12px;color:var(--accent);
+    text-decoration:underline;
+    font-family:inherit;
+  }
 </style>
 </head>
 <body>
@@ -74,6 +111,20 @@
   <button id="ipdPlus" aria-label="increase lens spacing">+</button>
 </div>
 
+<div id="recRow">
+  <label id="recLabel">
+    <input type="checkbox" id="recToggle">
+    record eyes (experimental)
+  </label>
+</div>
+
+<video id="camPreview" muted playsinline autoplay></video>
+
+<div id="downloads" class="hidden">
+  <a id="dlVideo" download="gaze-recording.webm">download video</a>
+  <a id="dlEvents" download="gaze-events.json">download timestamps</a>
+</div>
+
 <script>
 (() => {
   const canvas = document.getElementById('stage');
@@ -84,13 +135,15 @@
   // ------------- Cardboard v1 (2014) optics -------------
   // Lens centers: 60 mm apart, fixed. 25 mm biconvex lenses.
   // Screen-to-lens distance: ~42 mm.
-  // v1 lenses are smaller and softer off-axis than v2, so the dot is kept
-  // within ~14 mm of each lens axis (~18 deg eccentricity) and the visible
-  // circle is masked tighter.
+  // v1 lenses are smaller and softer off-axis than v2. maxEccentricityMm
+  // is now ~90% of the visible aperture radius — close to the true edge
+  // of what the lens shows, while leaving a small margin so the dot never
+  // vanishes into the vignette. Push it to lensApertureMm itself for the
+  // absolute physical edge, at the cost of sharpness/distortion there.
   const DEVICE = {
     lensSpacingMm: 60,
     screenToLensMm: 42,
-    maxEccentricityMm: 14,      // radial cap around each lens axis
+    maxEccentricityMm: 17,      // radial cap around each lens axis (~90% of aperture)
     lensApertureMm: 19,         // radius of visible circle through one lens (approx)
   };
 
@@ -117,6 +170,83 @@
   let state = 'intro';
   let stateT0 = 0;
   let wakeLock = null;
+
+  // ---- camera recording (opt-in) ----
+  const recToggle = document.getElementById('recToggle');
+  const camPreview = document.getElementById('camPreview');
+  const downloadsEl = document.getElementById('downloads');
+  const dlVideo = document.getElementById('dlVideo');
+  const dlEvents = document.getElementById('dlEvents');
+  let camStream = null;
+  let recorder = null;
+  let recChunks = [];
+  let recMimeType = '';
+  let events = null; // { armStart, flashStart, taskStart, trialStarts:[], doneAt }
+
+  async function setupCamera(){
+    if (camStream) return camStream; // already have it
+    try {
+      camStream = await navigator.mediaDevices.getUserMedia({
+        video: { facingMode: 'user' }, audio: false
+      });
+      camPreview.srcObject = camStream;
+      return camStream;
+    } catch(e){
+      console.warn('camera unavailable', e);
+      camStream = null;
+      return null;
+    }
+  }
+
+  function pickMimeType(){
+    const candidates = [
+      'video/mp4;codecs=h264',
+      'video/mp4',
+      'video/webm;codecs=vp9',
+      'video/webm',
+    ];
+    for (const c of candidates){
+      if (window.MediaRecorder && MediaRecorder.isTypeSupported && MediaRecorder.isTypeSupported(c)) return c;
+    }
+    return ''; // let the browser choose
+  }
+
+  function startRecording(){
+    if (!camStream || !window.MediaRecorder) return;
+    recChunks = [];
+    recMimeType = pickMimeType();
+    try {
+      recorder = recMimeType ? new MediaRecorder(camStream, { mimeType: recMimeType }) : new MediaRecorder(camStream);
+      recorder.ondataavailable = e => { if (e.data && e.data.size) recChunks.push(e.data); };
+      recorder.start();
+    } catch(e){
+      console.warn('recording failed to start', e);
+      recorder = null;
+    }
+  }
+
+  function stopRecordingAndExpose(){
+    if (!recorder){ downloadsEl.classList.add('hidden'); return; }
+    recorder.onstop = () => {
+      const blob = new Blob(recChunks, { type: recMimeType || 'video/webm' });
+      const url = URL.createObjectURL(blob);
+      const ext = (recMimeType || '').includes('mp4') ? 'mp4' : 'webm';
+      dlVideo.href = url;
+      dlVideo.download = 'gaze-recording.' + ext;
+
+      const evBlob = new Blob([JSON.stringify(events, null, 2)], { type: 'application/json' });
+      dlEvents.href = URL.createObjectURL(evBlob);
+
+      downloadsEl.classList.remove('hidden');
+    };
+    try { recorder.stop(); } catch(e){}
+    recorder = null;
+    if (camStream){
+      camStream.getTracks().forEach(tr => tr.stop());
+      camStream = null;
+    }
+    document.body.classList.remove('show-preview');
+  }
 
   function resize(){
     dpr = Math.min(window.devicePixelRatio || 1, 3);
@@ -270,8 +400,8 @@
           {text:'2. follow the dot, ~' + eccentricityDeg().toFixed(0) + '\u00b0 out', color:'#8a8a86', size:11},
           {text:'keep your head still', color:'#8a8a86', size:11},
           {text:'', size:5},
-          {text:'tap screen, then you have', color:'#5ad1b9', size:11},
-          {text:'15 s to insert the phone', color:'#5ad1b9', size:11},
+          {text:'tap once, or just rotate', color:'#5ad1b9', size:11},
+          {text:'into the viewer to begin', color:'#5ad1b9', size:11},
         ], {size:11});
       }
       drawLensMasks(eyes);
@@ -291,6 +421,8 @@
       drawLensMasks(eyes);
       if (remain <= 0){
         beep(880, 180);           // start beep
+        if (camStream) startRecording();
+        if (events) events.flashStart = Date.now();
         setState('flash', now);
       }
     }
@@ -300,6 +432,9 @@
       if (o === null){
         setState('done', now);
       } else {
+        if (events && events.trialStarts[o.trial] === undefined){
+          events.trialStarts[o.trial] = { direction: CFG.directions[o.trial], t: Date.now() };
+        }
         for (const e of eyes){
           drawFixationRing(e.x, e.y);
           drawDot(e.x, e.y, o.dx, o.dy, CFG.dotRadiusPx);
@@ -333,10 +468,16 @@
   function setState(s, now){
     if (s === 'done' && state === 'task'){
       beep(660, 150); setTimeout(() => beep(660, 150), 250);  // double beep = finished
+      if (events) events.doneAt = Date.now();
+      stopRecordingAndExpose();
+    }
+    if (s === 'intro'){
+      downloadsEl.classList.add('hidden');
     }
     state = s;
     stateT0 = now || performance.now();
     ipdUI.classList.toggle('hidden', s !== 'intro');
+    document.getElementById('recRow').classList.toggle('hidden', s !== 'intro');
   }
 
   // ---- audio cues (context unlocked by the arming tap) ----
@@ -367,22 +508,60 @@
     if (document.visibilityState === 'visible' && (state === 'task' || state === 'flash')) requestWakeLock();
   });
 
-  canvas.addEventListener('pointerdown', () => {
+  // Shared entry point for starting a run, used by both a tap and an
+  // automatic landscape-rotation trigger. audioUnlocked tells us whether
+  // we can rely on beep() actually producing sound this time (iOS only
+  // allows audio after a real user gesture like a tap).
+  let audioUnlocked = false;
+
+  async function startRun(){
     if (!audioCtx){
-      try { audioCtx = new (window.AudioContext || window.webkitAudioContext)(); } catch(e){}
+      try {
+        audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        audioUnlocked = true;
+      } catch(e){}
     }
+    requestWakeLock();
+    if (recToggle.checked){
+      await setupCamera();
+      if (camStream) document.body.classList.add('show-preview');
+    }
+    events = { armStart: Date.now(), flashStart: null, trialStarts: [], doneAt: null };
+    beep(440, 120);              // confirm armed (silent if audio not yet unlocked)
+    setState('arm');
+  }
+
+  canvas.addEventListener('pointerdown', () => {
     // Only 'intro' and 'done' respond to taps. Once armed, a stray tap
     // (e.g. a double-tap, or the phone brushing the cardboard while being
     // inserted) must NOT cancel the run — you can't reach the screen once
     // it's in the viewer anyway.
     if (state === 'intro'){
-      requestWakeLock();
-      beep(440, 120);            // confirm armed
-      setState('arm');
+      startRun();
     } else if (state === 'done'){
       setState('intro');
     }
     // state === 'arm' | 'flash' | 'task': ignore taps entirely
+  });
+
+  // Auto-start on rotation into landscape — this is the natural motion of
+  // inserting the phone into the viewer, so it doubles as the "go" signal.
+  // Only fires from 'intro' or 'done', and only on an actual transition
+  // (not on page load, so you can still hold the phone up to check lens
+  // alignment without triggering a run). A short debounce avoids false
+  // triggers from a quick wobble while adjusting grip.
+  const landscapeQuery = window.matchMedia('(orientation: landscape)');
+  let rotateDebounce = null;
+  landscapeQuery.addEventListener('change', (e) => {
+    clearTimeout(rotateDebounce);
+    if (!e.matches) return; // only care about entering landscape
+    rotateDebounce = setTimeout(() => {
+      if (window.matchMedia('(orientation: landscape)').matches &&
+          (state === 'intro' || state === 'done')){
+        if (state === 'done') setState('intro', performance.now());
+        startRun();
+      }
+    }, 600);
   });
 
   const trimStep = 3; // px ≈ 0.5 mm per press
