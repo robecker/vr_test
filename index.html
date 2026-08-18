@@ -1,0 +1,410 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="mobile-web-app-capable" content="yes">
+<title>Gaze Task — Cardboard v1</title>
+<style>
+  :root{
+    --bg:#000;
+    --fg:#f2f2f0;
+    --dim:#8a8a86;
+    --accent:#5ad1b9;
+  }
+  *{margin:0;padding:0;box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+  html,body{
+    width:100%;height:100%;
+    background:var(--bg);
+    overflow:hidden;
+    touch-action:none;
+    overscroll-behavior:none;
+    font-family:"SF Mono", ui-monospace, Menlo, monospace;
+    color:var(--fg);
+    user-select:none;-webkit-user-select:none;
+  }
+  #stage{position:fixed;inset:0;width:100%;height:100%;display:block}
+  #rotate{
+    position:fixed;inset:0;background:var(--bg);
+    display:none;flex-direction:column;align-items:center;justify-content:center;
+    gap:18px;z-index:50;text-align:center;padding:32px;
+  }
+  #rotate .phone{
+    width:44px;height:74px;border:2px solid var(--fg);border-radius:8px;
+    animation:tilt 1.6s ease-in-out infinite;
+  }
+  @keyframes tilt{
+    0%,20%{transform:rotate(0deg)}
+    55%,80%{transform:rotate(-90deg)}
+    100%{transform:rotate(-90deg)}
+  }
+  #rotate p{font-size:14px;line-height:1.6;color:var(--dim);max-width:280px}
+  #rotate p b{color:var(--fg);font-weight:600}
+  @media (orientation:portrait){ #rotate{display:flex} }
+  #ipd{
+    position:fixed;
+    bottom:calc(10px + env(safe-area-inset-bottom));
+    left:50%;transform:translateX(-50%);
+    display:flex;gap:14px;align-items:center;
+    z-index:40;font-size:12px;color:var(--dim);
+  }
+  #ipd button{
+    background:none;border:1px solid var(--dim);color:var(--fg);
+    width:40px;height:32px;border-radius:6px;
+    font-family:inherit;font-size:16px;
+  }
+  #ipd button:active{background:#222}
+  .hidden{display:none !important}
+</style>
+</head>
+<body>
+
+<canvas id="stage"></canvas>
+
+<div id="rotate">
+  <div class="phone"></div>
+  <p><b>Rotate to landscape</b><br>then place the phone in the viewer, screen centered under the lenses.</p>
+</div>
+
+<div id="ipd">
+  <button id="ipdMinus" aria-label="decrease lens spacing">−</button>
+  <span id="ipdLabel">60 mm</span>
+  <button id="ipdPlus" aria-label="increase lens spacing">+</button>
+</div>
+
+<script>
+(() => {
+  const canvas = document.getElementById('stage');
+  const ctx = canvas.getContext('2d');
+  const ipdUI = document.getElementById('ipd');
+  const ipdLabel = document.getElementById('ipdLabel');
+
+  // ------------- Cardboard v1 (2014) optics -------------
+  // Lens centers: 60 mm apart, fixed. 25 mm biconvex lenses.
+  // Screen-to-lens distance: ~42 mm.
+  // v1 lenses are smaller and softer off-axis than v2, so the dot is kept
+  // within ~14 mm of each lens axis (~18 deg eccentricity) and the visible
+  // circle is masked tighter.
+  const DEVICE = {
+    lensSpacingMm: 60,
+    screenToLensMm: 42,
+    maxEccentricityMm: 14,      // radial cap around each lens axis
+    lensApertureMm: 19,         // radius of visible circle through one lens (approx)
+  };
+
+  // CSS px per mm. Standard iPhones (logical 163 ppi class) ≈ 6.06 px/mm.
+  // Fine-tuned automatically? Not possible on the web — trim buttons below adjust it.
+  const PX_PER_MM = 6.06;
+  const mm = v => v * PX_PER_MM;
+
+  const CFG = {
+    armCountdownMs: 15000,      // time to insert phone after tapping start
+    flashDurationMs: 3000,
+    moveOutMs: 1200,
+    holdMs: 800,
+    moveBackMs: 1200,
+    centerPauseMs: 600,
+    dotRadiusPx: 7,
+    directions: [0, 180, 90, 270, 45, 225, 135, 315], // deg; 0=right, 90=up
+  };
+
+  // trim (px) added to the nominal 64 mm spacing; persisted
+  let trim = parseFloat(localStorage.getItem('trimPx') || '0') || 0;
+
+  let dpr = 1, W = 0, H = 0;
+  let state = 'intro';
+  let stateT0 = 0;
+  let wakeLock = null;
+
+  function resize(){
+    dpr = Math.min(window.devicePixelRatio || 1, 3);
+    W = window.innerWidth;
+    H = window.innerHeight;
+    canvas.width = Math.round(W * dpr);
+    canvas.height = Math.round(H * dpr);
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  window.addEventListener('resize', resize);
+  window.addEventListener('orientationchange', () => setTimeout(resize, 250));
+  resize();
+
+  // Optical centers: 64 mm apart around screen center (matches v2 lens spacing),
+  // rather than screen quarters — so alignment holds on any iPhone width.
+  function eyeCenters(){
+    const half = mm(DEVICE.lensSpacingMm) / 2 + trim;
+    return [
+      { x: W/2 - half, y: H/2 },
+      { x: W/2 + half, y: H/2 },
+    ];
+  }
+
+  function updateIpdLabel(){
+    const effMm = (mm(DEVICE.lensSpacingMm) + 2*trim) / PX_PER_MM;
+    ipdLabel.textContent = effMm.toFixed(1) + ' mm';
+  }
+  updateIpdLabel();
+
+  // Eccentric travel: capped in mm to stay in the lens sweet spot,
+  // and never crossing the divider or screen edge.
+  function travelRadius(){
+    const half = mm(DEVICE.lensSpacingMm) / 2 + trim;
+    const roomToDivider = half - 14;
+    const roomToEdge = (W/2 - half) - 14;
+    const roomVert = H/2 - 14;
+    return Math.min(mm(DEVICE.maxEccentricityMm), roomToDivider, roomToEdge, roomVert);
+  }
+
+  // nominal visual angle of the eccentric point, for the log/labels
+  function eccentricityDeg(){
+    return Math.atan((travelRadius()/PX_PER_MM) / DEVICE.screenToLensMm) * 180/Math.PI;
+  }
+
+  function easeInOutCubic(t){
+    return t < 0.5 ? 4*t*t*t : 1 - Math.pow(-2*t + 2, 3) / 2;
+  }
+
+  function drawTextBlock(cx, cy, lines, opts = {}){
+    const size = opts.size || 13;
+    const lh = size * 1.7;
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    const total = lines.length * lh;
+    lines.forEach((ln, i) => {
+      ctx.font = (ln.bold ? '600 ' : '400 ') + (ln.size || size) + 'px "SF Mono", ui-monospace, Menlo, monospace';
+      ctx.fillStyle = ln.color || '#f2f2f0';
+      ctx.fillText(ln.text, cx, cy - total/2 + i*lh + lh/2);
+    });
+  }
+
+  function drawDot(cx, cy, dx, dy, r){
+    ctx.beginPath();
+    ctx.arc(cx + dx, cy + dy, r, 0, Math.PI * 2);
+    ctx.fillStyle = '#ffffff';
+    ctx.fill();
+  }
+
+  function drawFixationRing(cx, cy){
+    ctx.beginPath();
+    ctx.arc(cx, cy, 14, 0, Math.PI * 2);
+    ctx.strokeStyle = 'rgba(255,255,255,0.18)';
+    ctx.lineWidth = 1;
+    ctx.stroke();
+  }
+
+  // Circular vignette matching what each lens actually shows;
+  // everything outside fades to black so stray screen area is invisible.
+  function drawLensMasks(eyes){
+    const R = mm(DEVICE.lensApertureMm);
+    ctx.save();
+    // punch two circular holes in a full-screen black layer
+    ctx.beginPath();
+    ctx.rect(0, 0, W, H);
+    for (const e of eyes){
+      ctx.moveTo(e.x + R, e.y);
+      ctx.arc(e.x, e.y, R, 0, Math.PI*2, true);
+    }
+    ctx.fillStyle = '#000';
+    ctx.fill('evenodd');
+    // soft rim
+    for (const e of eyes){
+      const g = ctx.createRadialGradient(e.x, e.y, R*0.86, e.x, e.y, R);
+      g.addColorStop(0, 'rgba(0,0,0,0)');
+      g.addColorStop(1, 'rgba(0,0,0,1)');
+      ctx.beginPath();
+      ctx.arc(e.x, e.y, R, 0, Math.PI*2);
+      ctx.fillStyle = g;
+      ctx.fill();
+    }
+    ctx.restore();
+  }
+
+  const trialMs = () => CFG.moveOutMs + CFG.holdMs + CFG.moveBackMs + CFG.centerPauseMs;
+
+  function dotOffset(taskT){
+    const per = trialMs();
+    const idx = Math.floor(taskT / per);
+    if (idx >= CFG.directions.length) return null;
+    const t = taskT - idx * per;
+    const ang = CFG.directions[idx] * Math.PI / 180;
+    const R = travelRadius();
+    let p;
+    if (t < CFG.moveOutMs){
+      p = easeInOutCubic(t / CFG.moveOutMs);
+    } else if (t < CFG.moveOutMs + CFG.holdMs){
+      p = 1;
+    } else if (t < CFG.moveOutMs + CFG.holdMs + CFG.moveBackMs){
+      p = 1 - easeInOutCubic((t - CFG.moveOutMs - CFG.holdMs) / CFG.moveBackMs);
+    } else {
+      p = 0;
+    }
+    return { dx: Math.cos(ang) * R * p, dy: -Math.sin(ang) * R * p, trial: idx };
+  }
+
+  function frame(now){
+    if (!stateT0) stateT0 = now;
+    const t = now - stateT0;
+
+    if (state === 'flash'){
+      ctx.fillStyle = '#ffffff';
+      ctx.fillRect(0, 0, W, H);
+      if (t >= CFG.flashDurationMs) setState('task', now);
+      requestAnimationFrame(frame);
+      return;
+    }
+
+    ctx.fillStyle = '#000000';
+    ctx.fillRect(0, 0, W, H);
+
+    const eyes = eyeCenters();
+
+    if (state === 'intro'){
+      for (const e of eyes){
+        drawTextBlock(e.x, e.y - 8, [
+          {text:'GAZE TASK', bold:true, size:15},
+          {text:'', size:5},
+          {text:'1. white screen · 3 s', color:'#8a8a86', size:11},
+          {text:'2. follow the dot, ~' + eccentricityDeg().toFixed(0) + '\u00b0 out', color:'#8a8a86', size:11},
+          {text:'keep your head still', color:'#8a8a86', size:11},
+          {text:'', size:5},
+          {text:'tap screen, then you have', color:'#5ad1b9', size:11},
+          {text:'15 s to insert the phone', color:'#5ad1b9', size:11},
+        ], {size:11});
+      }
+      drawLensMasks(eyes);
+    }
+
+    if (state === 'arm'){
+      const remain = Math.max(0, CFG.armCountdownMs - t);
+      const secs = Math.ceil(remain / 1000);
+      for (const e of eyes){
+        drawTextBlock(e.x, e.y - 4, [
+          {text: String(secs), bold:true, size:44},
+          {text:'', size:8},
+          {text:'insert phone into viewer', color:'#8a8a86', size:11},
+          {text:'task starts at the beep', color:'#8a8a86', size:11},
+        ], {size:11});
+      }
+      drawLensMasks(eyes);
+      if (remain <= 0){
+        beep(880, 180);           // start beep
+        setState('flash', now);
+      }
+    }
+
+    if (state === 'task'){
+      const o = dotOffset(t);
+      if (o === null){
+        setState('done', now);
+      } else {
+        for (const e of eyes){
+          drawFixationRing(e.x, e.y);
+          drawDot(e.x, e.y, o.dx, o.dy, CFG.dotRadiusPx);
+        }
+        drawLensMasks(eyes);
+        const prog = (o.trial + 1) + '/' + CFG.directions.length;
+        for (const e of eyes){
+          ctx.font = '400 9px ui-monospace, Menlo, monospace';
+          ctx.fillStyle = 'rgba(255,255,255,0.12)';
+          ctx.textAlign = 'center';
+          ctx.fillText(prog, e.x, e.y + mm(DEVICE.lensApertureMm) - 18);
+        }
+      }
+    }
+
+    if (state === 'done'){
+      for (const e of eyes){
+        drawTextBlock(e.x, e.y, [
+          {text:'DONE', bold:true, size:15},
+          {text:'', size:5},
+          {text:'take the phone out', color:'#8a8a86', size:11},
+          {text:'tap to set up a new run', color:'#5ad1b9', size:11},
+        ], {size:11});
+      }
+      drawLensMasks(eyes);
+    }
+
+    requestAnimationFrame(frame);
+  }
+
+  function setState(s, now){
+    if (s === 'done' && state === 'task'){
+      beep(660, 150); setTimeout(() => beep(660, 150), 250);  // double beep = finished
+    }
+    state = s;
+    stateT0 = now || performance.now();
+    ipdUI.classList.toggle('hidden', s !== 'intro');
+  }
+
+  // ---- audio cues (context unlocked by the arming tap) ----
+  let audioCtx = null;
+  function beep(freq, ms){
+    try {
+      if (!audioCtx) return;
+      const o = audioCtx.createOscillator();
+      const g = audioCtx.createGain();
+      o.frequency.value = freq;
+      o.type = 'sine';
+      g.gain.setValueAtTime(0.25, audioCtx.currentTime);
+      g.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + ms/1000);
+      o.connect(g); g.connect(audioCtx.destination);
+      o.start();
+      o.stop(audioCtx.currentTime + ms/1000);
+    } catch(e){}
+  }
+
+  async function requestWakeLock(){
+    try {
+      if ('wakeLock' in navigator){
+        wakeLock = await navigator.wakeLock.request('screen');
+      }
+    } catch(e){}
+  }
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible' && (state === 'task' || state === 'flash')) requestWakeLock();
+  });
+
+  canvas.addEventListener('pointerdown', () => {
+    if (!audioCtx){
+      try { audioCtx = new (window.AudioContext || window.webkitAudioContext)(); } catch(e){}
+    }
+    // Only 'intro' and 'done' respond to taps. Once armed, a stray tap
+    // (e.g. a double-tap, or the phone brushing the cardboard while being
+    // inserted) must NOT cancel the run — you can't reach the screen once
+    // it's in the viewer anyway.
+    if (state === 'intro'){
+      requestWakeLock();
+      beep(440, 120);            // confirm armed
+      setState('arm');
+    } else if (state === 'done'){
+      setState('intro');
+    }
+    // state === 'arm' | 'flash' | 'task': ignore taps entirely
+  });
+
+  const trimStep = 3; // px ≈ 0.5 mm per press
+  document.getElementById('ipdMinus').addEventListener('pointerdown', e => {
+    e.stopPropagation();
+    trim -= trimStep;
+    localStorage.setItem('trimPx', trim);
+    updateIpdLabel();
+  });
+  document.getElementById('ipdPlus').addEventListener('pointerdown', e => {
+    e.stopPropagation();
+    trim += trimStep;
+    localStorage.setItem('trimPx', trim);
+    updateIpdLabel();
+  });
+
+  document.addEventListener('gesturestart', e => e.preventDefault());
+  document.addEventListener('touchmove', e => e.preventDefault(), {passive:false});
+
+  setState('intro');
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
