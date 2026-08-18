@@ -45,6 +45,15 @@
   }
   #rotate p{font-size:14px;line-height:1.6;color:var(--dim);max-width:280px}
   #rotate p b{color:var(--fg);font-weight:600}
+  #rotate .version{
+    font-size:15px;
+    color:var(--accent);
+    letter-spacing:0.5px;
+    padding:6px 14px;
+    border:1px solid var(--accent);
+    border-radius:6px;
+    margin-top:6px;
+  }
   @media (orientation:portrait){ #rotate{display:flex} }
   #ipd{
     position:fixed;
@@ -111,6 +120,7 @@
 <div id="rotate">
   <div class="phone"></div>
   <p><b>Rotate to landscape</b><br>then place the phone in the viewer, screen centered under the lenses.</p>
+  <div class="version" id="rotateVersion">v…</div>
 </div>
 
 <div id="ipd">
@@ -174,6 +184,7 @@
   // confirm at a glance whether your phone has actually loaded the latest
   // version, rather than a cached copy.
   const APP_VERSION = '2026-08-18a';
+  document.getElementById('rotateVersion').textContent = 'v' + APP_VERSION;
 
   const CFG = {
     armCountdownMs: 15000,      // max wait for first start — shake anytime to skip ahead
