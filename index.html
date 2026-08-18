@@ -6,6 +6,9 @@
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 <meta name="mobile-web-app-capable" content="yes">
+<meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
+<meta http-equiv="Pragma" content="no-cache">
+<meta http-equiv="Expires" content="0">
 <title>Gaze Task — Cardboard v1</title>
 <style>
   :root{
@@ -166,6 +169,11 @@
   // Fine-tuned automatically? Not possible on the web — trim buttons below adjust it.
   const PX_PER_MM = 6.06;
   const mm = v => v * PX_PER_MM;
+
+  // Bump this string on every edit — shown on the intro screen so you can
+  // confirm at a glance whether your phone has actually loaded the latest
+  // version, rather than a cached copy.
+  const APP_VERSION = '2026-08-18a';
 
   const CFG = {
     armCountdownMs: 15000,      // max wait for first start — shake anytime to skip ahead
@@ -485,6 +493,8 @@
           {text:'', size:5},
           {text:'tap once, or just rotate', color:'#5ad1b9', size:11},
           {text:'into position to begin', color:'#5ad1b9', size:11},
+          {text:'', size:6},
+          {text:'v' + APP_VERSION, color:'#3a3a38', size:8},
         ], {size:11});
       }
       drawLensMasks(eyes);
@@ -599,6 +609,7 @@
   function setState(s, now){
     if (s === 'done' && state === 'task'){
       beep(660, 150); setTimeout(() => beep(660, 150), 250);  // double beep = fully finished
+      speak('All done. You can remove the phone.');
       if (events) events.doneAt = Date.now();
       stopRecordingAndExpose();
     }
@@ -629,6 +640,17 @@
     } catch(e){}
   }
 
+  // ---- spoken cues (clearer than beeps for "it's actually over") ----
+  function speak(text){
+    try {
+      if (!('speechSynthesis' in window)) return;
+      const u = new SpeechSynthesisUtterance(text);
+      u.rate = 1.0;
+      u.volume = 1.0;
+      window.speechSynthesis.speak(u);
+    } catch(e){}
+  }
+
   async function requestWakeLock(){
     try {
       if ('wakeLock' in navigator){
@@ -654,6 +676,7 @@
       } catch(e){}
     }
     requestWakeLock();
+    speak(' '); // prime speech synthesis on this user gesture, for later use
     if (recToggle.checked){
       await setupCamera();
       if (camStream) document.body.classList.add('show-preview');
