@@ -63,9 +63,14 @@
     bottom:calc(48px + env(safe-area-inset-bottom));
     left:50%;transform:translateX(-50%);
     z-index:40;font-size:11px;color:var(--dim);
+    display:flex;gap:20px;align-items:center;
   }
-  #recLabel{display:flex;align-items:center;gap:8px}
+  #recLabel, #repLabel{display:flex;align-items:center;gap:8px}
   #recToggle{width:15px;height:15px}
+  #repSelect{
+    background:#111;color:var(--fg);border:1px solid var(--dim);
+    border-radius:4px;font-family:inherit;font-size:11px;padding:2px 4px;
+  }
 
   #camPreview{
     position:fixed;
@@ -116,6 +121,16 @@
     <input type="checkbox" id="recToggle">
     record eyes (experimental)
   </label>
+  <label id="repLabel">
+    repeats
+    <select id="repSelect">
+      <option value="1">1</option>
+      <option value="3" selected>3</option>
+      <option value="5">5</option>
+      <option value="10">10</option>
+      <option value="99">until I remove it</option>
+    </select>
+  </label>
 </div>
 
 <video id="camPreview" muted playsinline autoplay></video>
@@ -153,7 +168,9 @@
   const mm = v => v * PX_PER_MM;
 
   const CFG = {
-    armCountdownMs: 15000,      // time to insert phone after tapping start
+    armCountdownMs: 15000,      // max wait for first start — shake anytime to skip ahead
+    restBetweenMs: 6000,        // max wait between repeats — shake to skip ahead
+    readyMaxWaitMs: 5000,       // max wait after flash, before the dot starts moving
     flashDurationMs: 3000,
     moveOutMs: 1200,
     holdMs: 800,
@@ -161,6 +178,9 @@
     centerPauseMs: 600,
     dotRadiusPx: 7,
     directions: [0, 180, 90, 270, 45, 225, 135, 315], // deg; 0=right, 90=up
+    shakeIgnoreWindowMs: 900,   // ignore shakes right as a wait-state begins (residual motion)
+    shakeThreshold: 20,         // summed |Δaccel| (m/s²) to register as a shake
+    shakeCooldownMs: 1200,      // min gap between accepted shakes
   };
 
   // trim (px) added to the nominal 64 mm spacing; persisted
@@ -170,6 +190,9 @@
   let state = 'intro';
   let stateT0 = 0;
   let wakeLock = null;
+  let repSelect = document.getElementById('repSelect');
+  let totalRepeats = 1;
+  let repeatsDone = 0;
 
   // ---- camera recording (opt-in) ----
   const recToggle = document.getElementById('recToggle');
@@ -181,7 +204,7 @@
   let recorder = null;
   let recChunks = [];
   let recMimeType = '';
-  let events = null; // { armStart, flashStart, taskStart, trialStarts:[], doneAt }
+  let events = null; // { armStart, cycles: [{flashStart, trialStarts:[...]}], doneAt }
 
   async function setupCamera(){
     if (camStream) return camStream; // already have it
@@ -246,6 +269,62 @@
       camStream = null;
     }
     document.body.classList.remove('show-preview');
+  }
+
+  // ---- shake detection (opt-in "advance now" gesture) ----
+  // A shake replaces the countdown/rest waits with an active "I'm ready"
+  // signal, usable from inside a fixed harness where the screen is out of
+  // reach. Every shake-gated wait still has a timeout fallback, so nothing
+  // ever stalls forever if a shake doesn't register or motion access was
+  // denied/unavailable.
+  let motionPermissionGranted = false;
+  let lastAccel = null;
+  let lastShakeAcceptedAt = 0;
+  let pendingShakeAdvance = false;
+
+  function handleMotion(e){
+    const acc = e.accelerationIncludingGravity || e.acceleration;
+    if (!acc || acc.x === null) return;
+    if (lastAccel){
+      const delta = Math.abs(acc.x - lastAccel.x) + Math.abs(acc.y - lastAccel.y) + Math.abs(acc.z - lastAccel.z);
+      const now = Date.now();
+      if (delta > CFG.shakeThreshold && (now - lastShakeAcceptedAt) > CFG.shakeCooldownMs){
+        lastShakeAcceptedAt = now;
+        pendingShakeAdvance = true;
+      }
+    }
+    lastAccel = { x: acc.x, y: acc.y, z: acc.z };
+  }
+
+  async function requestMotionPermission(){
+    try {
+      if (typeof DeviceMotionEvent !== 'undefined' && typeof DeviceMotionEvent.requestPermission === 'function'){
+        const res = await DeviceMotionEvent.requestPermission();  // iOS: must follow a real tap
+        motionPermissionGranted = (res === 'granted');
+      } else if (typeof DeviceMotionEvent !== 'undefined'){
+        motionPermissionGranted = true;  // non-iOS: no explicit permission needed
+      }
+    } catch(e){
+      motionPermissionGranted = false;
+    }
+    if (motionPermissionGranted && !motionListenerAdded){
+      window.addEventListener('devicemotion', handleMotion);
+      motionListenerAdded = true;
+    }
+  }
+  let motionListenerAdded = false;
+
+  // Call from inside a shake-gated state's render block. Returns true the
+  // *first* frame a shake is accepted after the ignore window, and false
+  // otherwise — consuming the pending flag so it only fires once.
+  function checkShakeAdvance(elapsedInState){
+    if (!motionPermissionGranted) return false;
+    if (elapsedInState < CFG.shakeIgnoreWindowMs) return false;
+    if (pendingShakeAdvance){
+      pendingShakeAdvance = false;
+      return true;
+    }
+    return false;
   }
 
   function resize(){
@@ -381,7 +460,7 @@
     if (state === 'flash'){
       ctx.fillStyle = '#ffffff';
       ctx.fillRect(0, 0, W, H);
-      if (t >= CFG.flashDurationMs) setState('task', now);
+      if (t >= CFG.flashDurationMs) setState('ready', now);
       requestAnimationFrame(frame);
       return;
     }
@@ -400,8 +479,12 @@
           {text:'2. follow the dot, ~' + eccentricityDeg().toFixed(0) + '\u00b0 out', color:'#8a8a86', size:11},
           {text:'keep your head still', color:'#8a8a86', size:11},
           {text:'', size:5},
+          {text:'set up once, then mount', color:'#8a8a86', size:11},
+          {text:'into the harness — shake to', color:'#8a8a86', size:11},
+          {text:'advance, or it auto-continues', color:'#8a8a86', size:11},
+          {text:'', size:5},
           {text:'tap once, or just rotate', color:'#5ad1b9', size:11},
-          {text:'into the viewer to begin', color:'#5ad1b9', size:11},
+          {text:'into position to begin', color:'#5ad1b9', size:11},
         ], {size:11});
       }
       drawLensMasks(eyes);
@@ -415,32 +498,72 @@
           {text: String(secs), bold:true, size:44},
           {text:'', size:8},
           {text:'insert phone into viewer', color:'#8a8a86', size:11},
-          {text:'task starts at the beep', color:'#8a8a86', size:11},
+          {text: motionPermissionGranted ? 'shake to start now, or wait' : 'task starts at the beep', color:'#8a8a86', size:11},
         ], {size:11});
       }
       drawLensMasks(eyes);
-      if (remain <= 0){
-        beep(880, 180);           // start beep
-        if (camStream) startRecording();
-        if (events) events.flashStart = Date.now();
-        setState('flash', now);
+      if (remain <= 0 || checkShakeAdvance(t)){
+        beginCycle(now);
+      }
+    }
+
+    if (state === 'rest'){
+      const remain = Math.max(0, CFG.restBetweenMs - t);
+      const secs = Math.ceil(remain / 1000);
+      for (const e of eyes){
+        drawTextBlock(e.x, e.y - 4, [
+          {text: String(secs), bold:true, size:36},
+          {text:'', size:8},
+          {text:'rest — repeat ' + (repeatsDone + 1) + ' of ' + totalRepeats, color:'#8a8a86', size:11},
+          {text: motionPermissionGranted ? 'shake when ready' : 'no need to touch anything', color:'#8a8a86', size:11},
+        ], {size:11});
+      }
+      drawLensMasks(eyes);
+      if (remain <= 0 || checkShakeAdvance(t)){
+        beginCycle(now);
+      }
+    }
+
+    if (state === 'ready'){
+      const remain = Math.max(0, CFG.readyMaxWaitMs - t);
+      for (const e of eyes){
+        drawFixationRing(e.x, e.y);
+        drawDot(e.x, e.y, 0, 0, CFG.dotRadiusPx);
+      }
+      drawLensMasks(eyes);
+      for (const e of eyes){
+        drawTextBlock(e.x, e.y - 30, [
+          {text: motionPermissionGranted ? 'shake when ready' : '', color:'#8a8a86', size:10},
+        ], {size:10});
+      }
+      if (remain <= 0 || checkShakeAdvance(t)){
+        setState('task', now);
       }
     }
 
     if (state === 'task'){
       const o = dotOffset(t);
       if (o === null){
-        setState('done', now);
+        repeatsDone++;
+        if (repeatsDone < totalRepeats){
+          beep(520, 120);  // short "cycle complete" chirp, distinct from the final double-beep
+          setState('rest', now);
+        } else {
+          setState('done', now);
+        }
       } else {
-        if (events && events.trialStarts[o.trial] === undefined){
-          events.trialStarts[o.trial] = { direction: CFG.directions[o.trial], t: Date.now() };
+        if (events && events.cycles.length){
+          const cyc = events.cycles[events.cycles.length - 1];
+          if (cyc.trialStarts[o.trial] === undefined){
+            cyc.trialStarts[o.trial] = { direction: CFG.directions[o.trial], t: Date.now() };
+          }
         }
         for (const e of eyes){
           drawFixationRing(e.x, e.y);
           drawDot(e.x, e.y, o.dx, o.dy, CFG.dotRadiusPx);
         }
         drawLensMasks(eyes);
-        const prog = (o.trial + 1) + '/' + CFG.directions.length;
+        const prog = 'rep ' + (repeatsDone + 1) + '/' + totalRepeats + '  ·  ' + (o.trial + 1) + '/' + CFG.directions.length;
         for (const e of eyes){
           ctx.font = '400 9px ui-monospace, Menlo, monospace';
           ctx.fillStyle = 'rgba(255,255,255,0.12)';
@@ -455,6 +578,7 @@
         drawTextBlock(e.x, e.y, [
           {text:'DONE', bold:true, size:15},
           {text:'', size:5},
+          {text: totalRepeats + ' repeat' + (totalRepeats>1?'s':'') + ' complete', color:'#8a8a86', size:11},
           {text:'take the phone out', color:'#8a8a86', size:11},
           {text:'tap to set up a new run', color:'#5ad1b9', size:11},
         ], {size:11});
@@ -465,9 +589,16 @@
     requestAnimationFrame(frame);
   }
 
+  function beginCycle(now){
+    beep(880, 180);           // start-of-cycle beep
+    if (camStream && !recorder) startRecording();  // recording spans the whole session, starts once
+    if (events) events.cycles.push({ flashStart: Date.now(), trialStarts: [] });
+    setState('flash', now);
+  }
+
   function setState(s, now){
     if (s === 'done' && state === 'task'){
-      beep(660, 150); setTimeout(() => beep(660, 150), 250);  // double beep = finished
+      beep(660, 150); setTimeout(() => beep(660, 150), 250);  // double beep = fully finished
       if (events) events.doneAt = Date.now();
       stopRecordingAndExpose();
     }
@@ -476,8 +607,9 @@
     }
     state = s;
     stateT0 = now || performance.now();
-    ipdUI.classList.toggle('hidden', s !== 'intro');
-    document.getElementById('recRow').classList.toggle('hidden', s !== 'intro');
+    const controlsVisible = (s === 'intro');
+    ipdUI.classList.toggle('hidden', !controlsVisible);
+    document.getElementById('recRow').classList.toggle('hidden', !controlsVisible);
   }
 
   // ---- audio cues (context unlocked by the arming tap) ----
@@ -526,7 +658,10 @@
       await setupCamera();
       if (camStream) document.body.classList.add('show-preview');
     }
-    events = { armStart: Date.now(), flashStart: null, trialStarts: [], doneAt: null };
+    await requestMotionPermission();
+    totalRepeats = parseInt(repSelect.value, 10) || 1;
+    repeatsDone = 0;
+    events = { armStart: Date.now(), cycles: [], doneAt: null };
     beep(440, 120);              // confirm armed (silent if audio not yet unlocked)
     setState('arm');
   }
